@@ -9,6 +9,7 @@ import numpy as np
 import pickle
 import json
 import io
+import os
 from datetime import datetime
 import warnings
 try:
@@ -16,6 +17,13 @@ try:
     FAISS_OK = True
 except ImportError:
     FAISS_OK = False
+
+try:
+    from google import genai
+    GEMINI_OK = True
+except ImportError:
+    genai = None
+    GEMINI_OK = False
 warnings.filterwarnings("ignore")
 
 st.set_page_config(
@@ -25,7 +33,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-for k, v in {"page":"home","cr":None,"dr":None}.items():
+for k, v in {"page":"home","cr":None,"dr":None,"assistant_msgs":[]}.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -428,6 +436,235 @@ def disease_report_csv(res):
     df.to_csv(buf, index=False, header=False)
     return buf.getvalue().encode()
 
+
+# ── AgriSense Assistant (Gemini + Context-Aware Fallback) ──────
+def get_gemini_key():
+    """Read Gemini key from Streamlit Secrets or environment. Never hardcode API keys."""
+    try:
+        key = st.secrets.get("GEMINI_API_KEY", None)
+        if key:
+            return str(key).strip()
+    except Exception:
+        pass
+    return os.getenv("GEMINI_API_KEY")
+
+def assistant_context_text():
+    """Build context from current Crop/Disease results for grounded answers."""
+    parts = []
+    cr = st.session_state.get("cr")
+    dr = st.session_state.get("dr")
+
+    if cr:
+        name = cr["name"]
+        info = CROP_INFO.get(name, {})
+        prob, cls = cr["prob"], cr["cls"]
+        top5 = np.argsort(prob)[::-1][:5]
+        top5_text = ", ".join([f"{cls[i].title()} ({round(prob[i]*100,1)}%)" for i in top5])
+        parts.append(f"""
+CURRENT CROP RECOMMENDATION RESULT:
+Recommended Crop: {name.title()}
+Confidence: {round(max(prob)*100,1)}%
+Top 5 Matches: {top5_text}
+Inputs: N={cr['N']}, P={cr['P']}, K={cr['K']}, pH={cr['ph']}, Temperature={cr['temp']}°C, Humidity={cr['humid']}%, Rainfall={cr['rain']}mm
+Crop Profile: Season={info.get('season','N/A')}, Water Requirement={info.get('water','N/A')}, Soil={info.get('soil','N/A')}, Optimal Temp={info.get('temp','N/A')}
+Expert Tip: {info.get('tip','N/A')}
+""")
+    else:
+        parts.append("CURRENT CROP RECOMMENDATION RESULT: Not generated yet.")
+
+    if dr:
+        docs_text = []
+        for doc in dr.get("docs", []):
+            docs_text.append(
+                f"Disease: {doc['disease']} | Description: {doc['desc']} | Treatment: {doc['tx']} | Prevention: {doc['prev']} | Source: {doc['src']} | Similarity: {doc['score']}"
+            )
+        prob_text = ", ".join([f"{lab}: {round(p*100,1)}%" for lab, p in zip(dr["labs"], dr["prob"])])
+        age_name = {15:"Seedling",35:"Vegetative",65:"Flowering",100:"Maturity"}.get(dr["age"],"Flowering")
+        field_adv = " | ".join(ADVISORIES.get(dr["risk"], []))
+        parts.append(f"""
+CURRENT DISEASE RISK RESULT:
+Crop: {dr['crop']}
+Growth Stage: {age_name}
+Risk Level: {dr['risk']}
+Risk Probabilities: {prob_text}
+Inputs: Temperature={dr['temp']}°C, Humidity={dr['humid']}%, Rainfall={dr['rain']}mm, Soil Moisture={dr['soil']}%, Wind Speed={dr['wind']} km/h, Previous Disease={'Yes' if dr['prev'] else 'No'}
+Retrieved FAISS/RAG Documents:
+{chr(10).join(docs_text) if docs_text else 'No retrieved documents.'}
+Field Advisory: {field_adv}
+""")
+    else:
+        parts.append("CURRENT DISEASE RISK RESULT: Not generated yet.")
+
+    return "\n".join(parts)
+
+def local_assistant_answer(question):
+    """Safe context-aware fallback when Gemini key/package is unavailable."""
+    q = question.lower().strip()
+    cr = st.session_state.get("cr")
+    dr = st.session_state.get("dr")
+
+    if not cr and not dr:
+        return (
+            "Please run **Crop Recommender** or **Disease Risk Predictor** first. "
+            "After that, I can explain the recommendation, risk level, confidence score, RAG advisory, treatment, prevention, and next steps."
+        )
+
+    hindi = any(x in q for x in [
+        "hindi", "hinglish", "samjhao", "bata", "batao", "kya", "kyu", "kaise",
+        "karna", "kare", "chahiye", "ab", "farmer", "kisaan", "kisan"
+    ])
+
+    wants_crop = any(x in q for x in [
+        "confidence", "score", "top", "recommend", "recommand", "recommended", "recommendation",
+        "crop", "maize", "fasal", "why this crop", "kyu recommend"
+    ])
+
+    wants_disease = any(x in q for x in [
+        "risk", "disease", "bimari", "बीमारी", "what should", "karu", "karna", "kare",
+        "action", "plan", "next", "treatment", "prevention", "spray", "medicine", "advisory"
+    ])
+
+    wants_rag = any(x in q for x in ["source", "rag", "faiss", "similarity", "document", "docs"])
+    wants_overall = any(x in q for x in ["overall", "summary", "explain overall", "project", "result explain"])
+
+    def crop_answer():
+        if not cr:
+            return "Please run the Crop Recommender first so I can explain the crop result."
+        name = cr["name"].title()
+        conf = round(max(cr["prob"])*100, 1)
+        info = CROP_INFO.get(cr["name"], {})
+        prob, cls = cr["prob"], cr["cls"]
+        top5 = np.argsort(prob)[::-1][:5]
+        top5_text = ", ".join([f"{cls[i].title()} ({round(prob[i]*100,1)}%)" for i in top5])
+        if hindi:
+            return (
+                f"**{name}** recommend hua kyunki tumhare soil inputs **N={cr['N']}, P={cr['P']}, K={cr['K']}, pH={cr['ph']}** "
+                f"aur climate values **Temp={cr['temp']}°C, Humidity={cr['humid']}%, Rainfall={cr['rain']}mm** is crop ke liye best match hain.\n\n"
+                f"- Confidence: **{conf}%**\n"
+                f"- Top matches: {top5_text}\n"
+                f"- Season: {info.get('season','N/A')}\n"
+                f"- Water requirement: {info.get('water','N/A')}\n"
+                f"- Expert tip: {info.get('tip','Regular monitoring rakho.')}"
+            )
+        return (
+            f"**{name}** was recommended because your soil profile and climate values matched it best among 22 crop classes.\n\n"
+            f"- Confidence: **{conf}%**\n"
+            f"- Top matches: {top5_text}\n"
+            f"- Season: {info.get('season','N/A')}\n"
+            f"- Water requirement: {info.get('water','N/A')}\n"
+            f"- Expert tip: {info.get('tip','Maintain regular monitoring and balanced inputs.')}"
+        )
+
+    def disease_answer():
+        if not dr:
+            return "Please run the Disease Risk Predictor first so I can explain disease risk and RAG advisory."
+        docs = dr.get("docs", [])
+        prob_text = ", ".join([f"{lab}: {round(p*100,1)}%" for lab, p in zip(dr["labs"], dr["prob"])])
+        doc_lines = "\n".join([
+            f"- **{d['disease']}**: {d['prev']} Source: {d['src']} (similarity {d['score']})" for d in docs
+        ]) or "- No source documents retrieved."
+        adv = "\n".join([f"- {a}" for a in ADVISORIES.get(dr["risk"], [])])
+        if hindi:
+            return (
+                f"Aapki **{dr['crop']}** crop ka disease risk **{dr['risk']}** hai. Probability breakdown: **{prob_text}**.\n\n"
+                f"**Ab farmer ko kya karna chahiye:**\n{adv}\n\n"
+                f"**Source-backed advisory:**\n{doc_lines}\n\n"
+                "Chemical treatment sirf symptoms visible hone par aur local KVK/agriculture expert ki guidance ke baad follow karein."
+            )
+        return (
+            f"Your **{dr['crop']}** disease risk is **{dr['risk']}**. Probability breakdown: **{prob_text}**.\n\n"
+            f"**Recommended action plan:**\n{adv}\n\n"
+            f"**Source-backed advisory retrieved:**\n{doc_lines}\n\n"
+            "Use chemical treatment only when symptoms are visible and preferably after consulting a local KVK/agriculture expert."
+        )
+
+    def rag_answer():
+        if not dr:
+            return "RAG/FAISS advisory is available after running the Disease Risk Predictor."
+        docs = dr.get("docs", [])
+        if not docs:
+            return "No RAG documents were retrieved for the current result."
+        return (
+            "FAISS vector search retrieved these source-backed disease documents:\n"
+            + "\n".join([f"- **{d['disease']}** from {d['src']} with similarity score {d['score']}" for d in docs])
+            + "\n\nSimilarity score shows how closely the retrieved advisory matched your crop and condition-based query."
+        )
+
+    def overall_answer():
+        out = []
+        if cr:
+            out.append(crop_answer())
+        if dr:
+            out.append(disease_answer())
+        return "\n\n---\n\n".join(out)
+
+    if wants_rag:
+        return rag_answer()
+    if wants_disease:
+        return disease_answer()
+    if wants_crop:
+        return crop_answer()
+    if wants_overall:
+        return overall_answer()
+
+    # If the user asks a vague follow-up, answer using available context instead of saying “run prediction first”.
+    if dr:
+        return disease_answer()
+    if cr:
+        return crop_answer()
+
+    return "Run Crop Recommender or Disease Risk Predictor first for personalized guidance."
+
+def gemini_assistant_answer(question):
+    """Generate grounded answer using Gemini. Falls back safely if unavailable."""
+    api_key = get_gemini_key()
+    if not GEMINI_OK or not api_key:
+        return local_assistant_answer(question)
+
+    context = assistant_context_text()
+    prompt = f"""
+You are AgriSense Assistant, a context-aware agriculture decision-support chatbot.
+
+Use only the provided project context below:
+{context}
+
+User question:
+{question}
+
+Rules:
+1. Do not invent pesticide names, chemical dosage, disease facts, or sources.
+2. If exact information is not available in the context, say that the user should consult a local agriculture officer or KVK.
+3. Explain in simple farmer-friendly language.
+4. If the user asks in Hindi/Hinglish, answer in Hindi/Hinglish. Otherwise answer in clear English.
+5. Make clear that this is a decision-support tool, not a replacement for agricultural experts.
+6. Use short bullet points for action steps.
+7. For treatment guidance, rely only on retrieved source-backed advisory.
+"""
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+        )
+        return response.text
+    except Exception as e:
+        return local_assistant_answer(question) + f"\n\n_Gemini fallback used because API response failed: {str(e)[:120]}_"
+
+def context_badge_html():
+    cr = st.session_state.get("cr")
+    dr = st.session_state.get("dr")
+    crop_text = "No crop result yet" if not cr else f"{cr['name'].title()} · {round(max(cr['prob'])*100,1)}% confidence"
+    disease_text = "No disease result yet" if not dr else f"{dr['crop']} · {dr['risk']} risk"
+    docs_text = "No RAG docs yet" if not dr else f"{len(dr.get('docs', []))} RAG docs retrieved"
+    return f"""
+    <div class="gc">
+      <h4>🧠 Current Assistant Context</h4>
+      <p>🌱 <b>Crop Result:</b> {crop_text}<br>
+      🦠 <b>Disease Result:</b> {disease_text}<br>
+      📚 <b>Knowledge Context:</b> {docs_text}</p>
+    </div>
+    """
+
 # ─────────────────────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────────────────────
@@ -441,10 +678,10 @@ with st.sidebar:
     """, unsafe_allow_html=True)
     st.markdown("<hr/>", unsafe_allow_html=True)
 
-    nav = st.radio("", ["🏠 Home","🌱 Crop Recommender","🦠 Disease Risk Predictor"],
+    nav = st.radio("", ["🏠 Home","🌱 Crop Recommender","🦠 Disease Risk Predictor","🤖 AgriSense Assistant"],
                    label_visibility="collapsed",
-                   index=["home","crop","disease"].index(st.session_state.page))
-    new_page = {"🏠 Home":"home","🌱 Crop Recommender":"crop","🦠 Disease Risk Predictor":"disease"}[nav]
+                   index=["home","crop","disease","assistant"].index(st.session_state.page))
+    new_page = {"🏠 Home":"home","🌱 Crop Recommender":"crop","🦠 Disease Risk Predictor":"disease","🤖 AgriSense Assistant":"assistant"}[nav]
     if new_page != st.session_state.page:
         st.session_state.page = new_page
         st.rerun()
@@ -753,6 +990,72 @@ elif st.session_state.page == "disease":
         for i, adv in enumerate(ADVISORIES[risk]):
             with (a1 if i%2==0 else a2):
                 st.markdown(f'<div class="adv">{adv}</div>', unsafe_allow_html=True)
+
+
+# ═════════════════════════════════════════════════════════════
+# AGRISENSE ASSISTANT
+# ═════════════════════════════════════════════════════════════
+elif st.session_state.page == "assistant":
+    st.markdown('<div class="sh">🤖 AgriSense Assistant</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div class="gc">
+      <h4>Ask follow-up questions about your crop recommendation, disease risk, RAG advisory, sources, similarity scores, treatment, prevention, or next steps.</h4>
+      <p>This assistant uses your latest Crop Recommender and Disease Risk Predictor results as context. For best answers, run a prediction first.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown(context_badge_html(), unsafe_allow_html=True)
+
+    if not get_gemini_key():
+        st.info("Gemini API key is not configured yet. Add GEMINI_API_KEY in Streamlit Secrets (deployed app) or .streamlit/secrets.toml (local app) to enable AI chatbot answers. Fallback mode is currently active.")
+    elif not GEMINI_OK:
+        st.warning("google-genai package is missing. Add google-genai to requirements.txt and redeploy the app.")
+
+    st.markdown('<div class="sh">✨ Suggested Questions</div>', unsafe_allow_html=True)
+    q1, q2, q3, q4 = st.columns(4)
+    suggested_question = None
+    with q1:
+        if st.button("🌱 Why this crop?", use_container_width=True):
+            suggested_question = "Why was this crop recommended? Explain the confidence score."
+    with q2:
+        if st.button("🦠 Explain risk", use_container_width=True):
+            suggested_question = "Explain my disease risk result and probability breakdown."
+    with q3:
+        if st.button("📚 Explain RAG", use_container_width=True):
+            suggested_question = "Explain the RAG advisory, sources, and similarity score."
+    with q4:
+        if st.button("🇮🇳 Hindi action plan", use_container_width=True):
+            suggested_question = "Hindi me simple action plan batao. Ab farmer ko kya karna chahiye?"
+
+    st.markdown('<div class="sh">💬 Chat</div>', unsafe_allow_html=True)
+
+    # Display previous messages
+    for msg in st.session_state.assistant_msgs:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    user_question = st.chat_input("Ask AgriSense Assistant...")
+    final_question = suggested_question or user_question
+
+    if final_question:
+        st.session_state.assistant_msgs.append({"role":"user", "content":final_question})
+        with st.chat_message("user"):
+            st.markdown(final_question)
+
+        with st.chat_message("assistant"):
+            with st.spinner("AgriSense Assistant is thinking..."):
+                answer = gemini_assistant_answer(final_question)
+                st.markdown(answer)
+        st.session_state.assistant_msgs.append({"role":"assistant", "content":answer})
+
+    c1, c2 = st.columns([1,3])
+    with c1:
+        if st.button("🧹 Clear Chat", use_container_width=True):
+            st.session_state.assistant_msgs = []
+            st.rerun()
+    with c2:
+        st.caption("Safety: advisory is generated from project context and retrieved sources. Always verify chemical treatment with local KVK/agriculture experts.")
+
 
 # ── FOOTER ────────────────────────────────────────────────────
 st.markdown("""
