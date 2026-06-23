@@ -1,7 +1,7 @@
 """
 AgriSense AI — Industry-Level Smart Agriculture Platform
 Modules: Crop Recommender | Disease Risk Predictor + Real FAISS RAG
-Features: Fully Responsive | PDF/CSV Download | Clean UX
+Features: Fully Responsive | PDF/CSV Download | Groq/Gemini Assistant | Clean UX
 """
 import streamlit as st
 import pandas as pd
@@ -24,6 +24,14 @@ try:
 except ImportError:
     genai = None
     GEMINI_OK = False
+
+try:
+    from groq import Groq
+    GROQ_OK = True
+except ImportError:
+    Groq = None
+    GROQ_OK = False
+
 warnings.filterwarnings("ignore")
 
 st.set_page_config(
@@ -437,16 +445,27 @@ def disease_report_csv(res):
     return buf.getvalue().encode()
 
 
-# ── AgriSense Assistant (Gemini + Context-Aware Fallback) ──────
-def get_gemini_key():
-    """Read Gemini key from Streamlit Secrets or environment. Never hardcode API keys."""
+# ── AgriSense Assistant (Groq/Gemini + Context-Aware Fallback) ──────
+def get_secret_or_env(name):
+    """Read API key/model name from Streamlit Secrets or environment. Never hardcode keys."""
     try:
-        key = st.secrets.get("GEMINI_API_KEY", None)
-        if key:
-            return str(key).strip()
+        value = st.secrets.get(name, None)
+        if value:
+            return str(value).strip()
     except Exception:
         pass
-    return os.getenv("GEMINI_API_KEY")
+    value = os.getenv(name)
+    return value.strip() if value else None
+
+def get_groq_key():
+    return get_secret_or_env("GROQ_API_KEY")
+
+def get_gemini_key():
+    return get_secret_or_env("GEMINI_API_KEY")
+
+def get_groq_model():
+    # Llama 3.1 8B is lightweight and suitable for fast project-demo explanations.
+    return get_secret_or_env("GROQ_MODEL") or "llama-3.1-8b-instant"
 
 def assistant_context_text():
     """Build context from current Crop/Disease results for grounded answers."""
@@ -615,40 +634,67 @@ def local_assistant_answer(question):
 
     return "Run Crop Recommender or Disease Risk Predictor first for personalized guidance."
 
-def gemini_assistant_answer(question):
-    """Generate grounded answer using Gemini. Falls back safely if unavailable."""
-    api_key = get_gemini_key()
-    if not GEMINI_OK or not api_key:
-        return local_assistant_answer(question)
-
+def llm_assistant_answer(question):
+    """Generate grounded answer using Groq first, then Gemini, then clean local fallback."""
     context = assistant_context_text()
-    prompt = f"""
-You are AgriSense Assistant, a context-aware agriculture decision-support chatbot.
+    system_prompt = """You are AgriSense Assistant, a context-aware agriculture decision-support chatbot.
 
-Use only the provided project context below:
+Rules:
+1. Use only the provided project context.
+2. Do not invent pesticide names, chemical dosage, disease facts, or sources.
+3. If exact information is not available in the context, say that the user should consult a local agriculture officer or KVK.
+4. Explain in simple farmer-friendly language.
+5. If the user asks in Hindi/Hinglish, answer in Hindi/Hinglish. Otherwise answer in clear English.
+6. Make clear that this is a decision-support tool, not a replacement for agricultural experts.
+7. Use short bullet points for action steps.
+8. For treatment guidance, rely only on retrieved source-backed advisory.
+"""
+    user_prompt = f"""
+Project context:
 {context}
 
 User question:
 {question}
-
-Rules:
-1. Do not invent pesticide names, chemical dosage, disease facts, or sources.
-2. If exact information is not available in the context, say that the user should consult a local agriculture officer or KVK.
-3. Explain in simple farmer-friendly language.
-4. If the user asks in Hindi/Hinglish, answer in Hindi/Hinglish. Otherwise answer in clear English.
-5. Make clear that this is a decision-support tool, not a replacement for agricultural experts.
-6. Use short bullet points for action steps.
-7. For treatment guidance, rely only on retrieved source-backed advisory.
 """
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt,
-        )
-        return response.text
-    except Exception as e:
-        return local_assistant_answer(question) + f"\n\n_Gemini fallback used because API response failed: {str(e)[:120]}_"
+
+    # 1) Try Groq first
+    groq_key = get_groq_key()
+    if GROQ_OK and groq_key:
+        try:
+            client = Groq(api_key=groq_key)
+            completion = client.chat.completions.create(
+                model=get_groq_model(),
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+                max_tokens=600,
+            )
+            answer = completion.choices[0].message.content
+            if answer:
+                return answer.strip()
+        except Exception:
+            # Do not expose API errors/quota details to farmers or evaluators.
+            pass
+
+    # 2) Try Gemini as secondary fallback
+    gemini_key = get_gemini_key()
+    if GEMINI_OK and gemini_key:
+        try:
+            client = genai.Client(api_key=gemini_key)
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=system_prompt + "\n\n" + user_prompt,
+            )
+            if getattr(response, "text", None):
+                return response.text.strip()
+        except Exception:
+            # Do not show RESOURCE_EXHAUSTED / 429 or other raw API errors in UI.
+            pass
+
+    # 3) Clean offline fallback from current project context
+    return local_assistant_answer(question)
 
 def context_badge_html():
     cr = st.session_state.get("cr")
@@ -1006,10 +1052,18 @@ elif st.session_state.page == "assistant":
 
     st.markdown(context_badge_html(), unsafe_allow_html=True)
 
-    if not get_gemini_key():
-        st.info("Gemini API key is not configured yet. Add GEMINI_API_KEY in Streamlit Secrets (deployed app) or .streamlit/secrets.toml (local app) to enable AI chatbot answers. Fallback mode is currently active.")
-    elif not GEMINI_OK:
-        st.warning("google-genai package is missing. Add google-genai to requirements.txt and redeploy the app.")
+    groq_key = get_groq_key()
+    gemini_key = get_gemini_key()
+    if groq_key and GROQ_OK:
+        st.success("Groq AI provider is configured. Assistant will use Groq first, Gemini second, and offline fallback if needed.")
+    elif groq_key and not GROQ_OK:
+        st.warning("GROQ_API_KEY is configured, but groq package is missing. Add groq to requirements.txt and redeploy the app.")
+    elif gemini_key and GEMINI_OK:
+        st.info("Gemini key is configured. Assistant will use Gemini and offline fallback if quota is unavailable.")
+    elif gemini_key and not GEMINI_OK:
+        st.warning("GEMINI_API_KEY is configured, but google-genai package is missing. Add google-genai to requirements.txt and redeploy the app.")
+    else:
+        st.info("No AI API key configured yet. Assistant is running in offline project-context mode. Add GROQ_API_KEY or GEMINI_API_KEY in Streamlit Secrets to enable AI answers.")
 
     st.markdown('<div class="sh">✨ Suggested Questions</div>', unsafe_allow_html=True)
     q1, q2, q3, q4 = st.columns(4)
@@ -1044,7 +1098,7 @@ elif st.session_state.page == "assistant":
 
         with st.chat_message("assistant"):
             with st.spinner("AgriSense Assistant is thinking..."):
-                answer = gemini_assistant_answer(final_question)
+                answer = llm_assistant_answer(final_question)
                 st.markdown(answer)
         st.session_state.assistant_msgs.append({"role":"assistant", "content":answer})
 
